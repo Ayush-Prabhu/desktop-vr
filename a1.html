@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webcam Multi-Object Parallax</title>
+    <!-- 1. Load Tailwind CSS for styling --><script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 2. Load MediaPipe libraries for face tracking --><script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+    <!-- NEW: Load JSZip library for zipping files --><script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            overflow: hidden; /* Prevent scrollbars */
+        }
+        #info-container {
+            position: absolute;
+            /* MOVED DOWN to make space for record buttons */
+            top: 6rem;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+        }
+        /* The three.js canvas will be added by the script */
+        canvas {
+            display: block;
+        }
+        /* Hide the video element used for processing */
+        #input_video {
+            display: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+    <!-- 3. Video element for webcam input --><video id="input_video"></video>
+
+    <!-- NEW: Recording controls -->
+    <div id="record-controls" class="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex gap-4">
+        <button id="start-record-btn" class="px-4 py-2 bg-green-500 hover:bg-green-600 rounded-lg shadow-lg font-semibold transition-all">
+            Start Recording
+        </button>
+        <button id="stop-record-btn" class="px-4 py-2 bg-red-500 hover:bg-red-600 rounded-lg shadow-lg font-semibold transition-all" style="display: none;">
+            Stop Recording
+        </button>
+    </div>
+
+    <!-- 4. Info text container -->
+    <div id="info-container" class="max-w-md p-6 bg-gray-800 rounded-lg shadow-xl text-center opacity-90">
+        <h1 class="text-2xl font-bold mb-2 text-cyan-400">Webcam Parallax View</h1>
+        <!-- ADDED ID to this <p> tag -->
+        <p id="info-text" class="text-gray-300">
+            Move your head to see "around" the scene. Lean in/out to zoom.
+        </p>
+    </div>
+
+    <!-- 5. Setup Three.js via importmap --><script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <!-- 6. Main application logic --><script type="module">
+        import * as THREE from 'three';
+
+        let camera, scene, renderer;
+        let centralCube, sceneGroup;
+        let neutralEyeDist = null; // For proximity calibration
+        const baseCamZ = 5; // Neutral camera Z position
+        const closeThresholdZ = 2.0; // How close to get before cube vanishes
+
+        // --- THREE.JS SETUP ---
+
+        function initThree() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x101010);
+
+            // Camera - Will be moved by head tracking
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, baseCamZ); 
+            camera.lookAt(0,0,0); 
+
+            // Group to hold all objects
+            sceneGroup = new THREE.Group();
+            scene.add(sceneGroup);
+
+            // Central Cube
+            const cubeGeom = new THREE.BoxGeometry(1, 1, 1);
+            const cubeMat = new THREE.MeshNormalMaterial();
+            centralCube = new THREE.Mesh(cubeGeom, cubeMat);
+            sceneGroup.add(centralCube);
+
+            // Surrounding Spheres
+            const sphereGeom = new THREE.SphereGeometry(0.3, 20, 20);
+            const sphereMat = new THREE.MeshPhongMaterial({ color: 0x00ffff });
+
+            const positions = [
+                [2, 2, 0], [-2, 2, 0], [2, -2, 0], [-2, -2, 0],
+                [2, 0, 2], [-2, 0, 2], [2, 0, -2], [-2, 0, -2]
+            ];
+
+            for (const pos of positions) {
+                const sphere = new THREE.Mesh(sphereGeom, sphereMat.clone());
+                sphere.position.set(pos[0], pos[1], pos[2]);
+                sceneGroup.add(sphere);
+            }
+
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x404040);
+            scene.add(ambientLight);
+            const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+            hemisphereLight.position.set(0, 3, 0);
+            scene.add(hemisphereLight);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true }); // preserveDrawingBuffer is important for capture
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Handle window resizing
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // Handle window resize
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Animation loop
+        function animate() {
+            // Render the scene
+            renderer.render(scene, camera);
+        }
+
+        // --- MEDIAPIPE FACE MESH SETUP ---
+        
+        const videoElement = document.getElementById('input_video');
+        
+        function onResults(results) {
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+
+                // --- 1. Head Position (X, Y) ---
+                const nose = landmarks[1]; // normalized (0.0 to 1.0)
+                
+                const targetCamX = (nose.x - 0.5) * -6.0; // Increased sensitivity
+                const targetCamY = (nose.y - 0.5) * -6.0; // Increased sensitivity
+
+                // --- 2. Head Proximity (Z) ---
+                const leftEye = landmarks[130];
+                const rightEye = landmarks[359];
+                const eyeDist = Math.sqrt(
+                    Math.pow(leftEye.x - rightEye.x, 2) + 
+                    Math.pow(leftEye.y - rightEye.y, 2)
+                );
+
+                // --- 3. Calibration & Application ---
+                
+                if (neutralEyeDist === null && eyeDist > 0) {
+                    console.log("Calibrating neutral eye distance:", eyeDist);
+                    neutralEyeDist = eyeDist;
+                }
+
+                if (neutralEyeDist) {
+                    let proximityFactor = eyeDist / neutralEyeDist;
+                    proximityFactor = Math.min(Math.max(proximityFactor, 0.5), 2.5); // Clamp
+
+                    // Apply X, Y movement (Parallax)
+                    camera.position.x = THREE.MathUtils.lerp(camera.position.x, targetCamX, 0.1);
+                    camera.position.y = THREE.MathUtils.lerp(camera.position.y, targetCamY, 0.1);
+                    
+                    // Apply Z movement (Zoom)
+                    const targetCamZ = baseCamZ / proximityFactor; 
+                    camera.position.z = THREE.MathUtils.lerp(camera.position.z, targetCamZ, 0.1);
+
+                    // As requested: hide if too close
+                    if (camera.position.z < closeThresholdZ) {
+                        centralCube.visible = false;
+                    } else {
+                        centralCube.visible = true;
+                    }
+
+                    // Ensure camera always looks at the center of the scene
+                    camera.lookAt(0, 0, 0);
+                }
+                
+            } else {
+                // No face detected, reset camera and cube
+                camera.position.x = THREE.MathUtils.lerp(camera.position.x, 0, 0.1);
+                camera.position.y = THREE.MathUtils.lerp(camera.position.y, 0, 0.1);
+                camera.position.z = THREE.MathUtils.lerp(camera.position.z, baseCamZ, 0.1);
+                centralCube.visible = true;
+                
+                // Reset calibration
+                neutralEyeDist = null; 
+            }
+        }
+
+        const faceMesh = new window.FaceMesh({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }});
+        
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true, // Required for eye and temple landmarks
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        
+        faceMesh.onResults(onResults);
+
+        
+        // --- NEW: RECORDING LOGIC ---
+        const startBtn = document.getElementById('start-record-btn');
+        const stopBtn = document.getElementById('stop-record-btn');
+        const infoText = document.getElementById('info-text');
+
+        let camRecorder, canvasRecorder;
+        let camChunks = [], canvasChunks = [];
+        let isRecording = false;
+
+        startBtn.addEventListener('click', () => {
+            if (isRecording) return;
+            
+            // Check if camera stream is ready
+            if (!videoElement.srcObject) {
+                infoText.textContent = "Camera not ready. Please wait a moment and try again.";
+                return;
+            }
+            
+            isRecording = true;
+            infoText.textContent = "Recording...";
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'block';
+
+            // Clear previous recording chunks
+            camChunks = [];
+            canvasChunks = [];
+
+            // 1. Get Webcam Stream
+            const camStream = videoElement.srcObject;
+            // 2. Get Canvas Stream (30fps)
+            const canvasStream = renderer.domElement.captureStream(30);
+
+            // 3. Initialize Cam Recorder
+            camRecorder = new MediaRecorder(camStream, { mimeType: 'video/webm' });
+            camRecorder.ondataavailable = (e) => camChunks.push(e.data);
+            
+            // 4. Initialize Canvas Recorder
+            canvasRecorder = new MediaRecorder(canvasStream, { mimeType: 'video/webm' });
+            canvasRecorder.ondataavailable = (e) => canvasChunks.push(e.data);
+            
+            // 5. Start both
+            camRecorder.start();
+            canvasRecorder.start();
+        });
+
+        stopBtn.addEventListener('click', () => {
+            if (!isRecording) return;
+            
+            isRecording = false;
+            infoText.textContent = "Processing videos... please wait.";
+            stopBtn.style.display = 'none';
+            // Start button will reappear after zipping is done
+
+            // Create promises to wait for each recorder's 'onstop' event
+            const camPromise = new Promise(resolve => {
+                camRecorder.onstop = () => {
+                    const camBlob = new Blob(camChunks, { type: 'video/webm' });
+                    resolve({ name: 'webcam_video.webm', blob: camBlob });
+                };
+            });
+
+            const canvasPromise = new Promise(resolve => {
+                canvasRecorder.onstop = () => {
+                    const canvasBlob = new Blob(canvasChunks, { type: 'video/webm' });
+                    resolve({ name: 'visuals_video.webm', blob: canvasBlob });
+                };
+            });
+
+            // Stop recorders to trigger 'onstop' and blob creation
+            camRecorder.stop();
+            canvasRecorder.stop();
+
+            // Wait for both blobs to be ready, then zip them
+            Promise.all([camPromise, canvasPromise]).then(async (videos) => {
+                infoText.textContent = "Zipping files...";
+                
+                // JSZip is loaded from the <script> tag in <head>
+                const zip = new JSZip(); 
+                zip.file(videos[0].name, videos[0].blob); // Add webcam video
+                zip.file(videos[1].name, videos[1].blob); // Add canvas video
+
+                // Generate the .zip file
+                const zipBlob = await zip.generateAsync({ type: 'blob' });
+
+                // Create a download link for the zip
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(zipBlob);
+                a.download = 'parallax_recording.zip';
+                document.body.appendChild(a);
+                a.click(); // Trigger download
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+
+                // Reset UI
+                infoText.textContent = 'Move your head to see "around" the scene. Lean in/out to zoom.';
+                startBtn.style.display = 'block';
+
+            }).catch(err => {
+                console.error("Error creating zip file:", err);
+                infoText.textContent = "Error processing videos. Check console.";
+                startBtn.style.display = 'block';
+            });
+        });
+
+
+        // --- START EVERYTHING ---
+
+        // Initialize Three.js scene
+        initThree();
+        
+        // Start the Three.js render loop
+        renderer.setAnimationLoop(animate);
+
+        // Initialize MediaPipe camera helper
+        const cameraHelper = new window.Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        cameraHelper.start();
+        
+    </script>
+</body>
+</html>
+
